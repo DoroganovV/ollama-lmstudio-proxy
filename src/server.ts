@@ -212,6 +212,75 @@ function buildModelDetails() {
   };
 }
 
+// wraps a route handler so any thrown/rejected error becomes a 502 JSON response
+function asyncHandler(handler: (req: Request, res: ExpressResponse) => Promise<void>) {
+  return async (req: Request, res: ExpressResponse) => {
+    try {
+      await handler(req, res);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      res.status(502).json({ error: message });
+    }
+  };
+}
+
+// looks up a model by id, writing a 404 response and returning undefined if it's missing
+async function requireModel(res: ExpressResponse, id: string, allowPrefix = false): Promise<LmModel | undefined> {
+  const models = await getModels();
+  const found = allowPrefix
+    ? models.find((model) => model.id === id) ?? models.find((model) => model.id.startsWith(id))
+    : models.find((model) => model.id === id);
+
+  if (!found) {
+    res.status(404).json({ error: `model not found: ${id}` });
+    return undefined;
+  }
+
+  return found;
+}
+
+function extractDeltaContent(chunk: JsonRecord): string {
+  const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+  const first = choices[0] as JsonRecord | undefined;
+  const delta = first?.delta as JsonRecord | undefined;
+  return typeof delta?.content === 'string' ? delta.content : '';
+}
+
+// converts an LM Studio SSE chat stream into Ollama-style ndjson lines
+async function proxyChatToNdjson(
+  res: ExpressResponse,
+  lmResponse: globalThis.Response,
+  buildChunk: (piece: string) => JsonRecord,
+  buildFinal: () => JsonRecord
+): Promise<void> {
+  res.setHeader('Content-Type', 'application/x-ndjson');
+  res.setHeader('Transfer-Encoding', 'chunked');
+
+  await streamSseAsJson(lmResponse, (chunk) => {
+    const piece = extractDeltaContent(chunk);
+    if (piece.length > 0) {
+      res.write(`${JSON.stringify(buildChunk(piece))}\n`);
+    }
+  });
+
+  res.write(`${JSON.stringify(buildFinal())}\n`);
+  res.end();
+}
+
+// emits Ollama's fake progress ndjson stream (or a single success response) used by create/pull/push
+function respondStatusStream(res: ExpressResponse, stream: boolean, statuses: string[]): void {
+  if (stream) {
+    res.setHeader('Content-Type', 'application/x-ndjson');
+    for (const status of statuses) {
+      res.write(`${JSON.stringify({ status })}\n`);
+    }
+    res.end();
+    return;
+  }
+
+  res.json({ status: 'success' });
+}
+
 app.get('/', (_req, res) => {
   res.json({
     service: 'ollama-lmstudio-proxy',
@@ -224,81 +293,115 @@ app.get('/api/version', (_req, res) => {
   res.json({ version: '0.1.0' });
 });
 
-app.get('/api/tags', async (_req, res) => {
-  try {
-    const models = await getModels();
-    const modifiedAt = new Date().toISOString();
+app.get('/api/tags', asyncHandler(async (_req, res) => {
+  const models = await getModels();
+  const modifiedAt = new Date().toISOString();
 
-    res.json({
-      models: models.map((model) => ({
-        name: model.id,
-        model: model.id,
-        modified_at: modifiedAt,
-        size: 0,
-        digest: '',
-        details: buildModelDetails()
-      }))
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    res.status(502).json({ error: message });
+  res.json({
+    models: models.map((model) => ({
+      name: model.id,
+      model: model.id,
+      modified_at: modifiedAt,
+      size: 0,
+      digest: '',
+      details: buildModelDetails()
+    }))
+  });
+}));
+
+app.get('/api/ps', asyncHandler(async (_req, res) => {
+  const models = await getModels();
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + 5 * 60 * 1000).toISOString();
+
+  res.json({
+    models: models.map((model) => ({
+      name: model.id,
+      model: model.id,
+      size: 0,
+      digest: '',
+      details: buildModelDetails(),
+      expires_at: expiresAt,
+      size_vram: 0
+    }))
+  });
+}));
+
+app.get('/v1/models', asyncHandler(async (_req, res) => {
+  const models = await getModels();
+
+  res.json({
+    object: 'list',
+    data: models.map((model) => ({
+      id: model.id,
+      object: model.object ?? 'model',
+      owned_by: model.owned_by ?? 'lm_studio'
+    }))
+  });
+}));
+
+app.post('/v1/chat/completions', asyncHandler(async (req, res) => {
+  const stream = req.body?.stream === true;
+
+  const lmResponse = await lmFetch(CHAT_PATHS, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: stream ? 'text/event-stream' : 'application/json'
+    },
+    body: JSON.stringify(req.body ?? {})
+  });
+
+  res.status(lmResponse.status);
+  const contentType = lmResponse.headers.get('content-type');
+  if (contentType) {
+    res.setHeader('Content-Type', contentType);
   }
-});
 
-app.get('/api/ps', async (_req, res) => {
-  try {
-    const models = await getModels();
-    const now = new Date();
-    const expiresAt = new Date(now.getTime() + 5 * 60 * 1000).toISOString();
-
-    res.json({
-      models: models.map((model) => ({
-        name: model.id,
-        model: model.id,
-        size: 0,
-        digest: '',
-        details: buildModelDetails(),
-        expires_at: expiresAt,
-        size_vram: 0
-      }))
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    res.status(502).json({ error: message });
+  if (stream) {
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
   }
-});
 
-app.post('/api/show', async (req, res) => {
-  const requestedModel = typeof req.body?.model === 'string' ? req.body.model : '';
+  if (!lmResponse.body) {
+    res.end();
+    return;
+  }
 
-  try {
-    const models = await getModels();
-    const selected =
-      models.find((model) => model.id === requestedModel) ??
-      models.find((model) => model.id.startsWith(requestedModel));
+  const reader = lmResponse.body.getReader();
 
-    if (!selected) {
-      res.status(404).json({ error: `Model not found: ${requestedModel}` });
-      return;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
     }
 
-    res.json({
-      license: '',
-      modelfile: `FROM ${selected.id}`,
-      parameters: '',
-      template: '',
-      details: {
-        parent_model: '',
-        ...buildModelDetails()
-      },
-      model_info: {},
-      capabilities: ['completion', 'chat']
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    res.status(502).json({ error: message });
+    res.write(Buffer.from(value));
   }
-});
+
+  res.end();
+}));
+
+app.post('/api/show', asyncHandler(async (req, res) => {
+  const requestedModel = typeof req.body?.model === 'string' ? req.body.model : '';
+  const selected = await requireModel(res, requestedModel, true);
+  if (!selected) {
+    return;
+  }
+
+  res.json({
+    license: '',
+    modelfile: `FROM ${selected.id}`,
+    parameters: '',
+    template: '',
+    details: {
+      parent_model: '',
+      ...buildModelDetails()
+    },
+    model_info: {},
+    capabilities: ['completion', 'chat']
+  });
+}));
 
 app.post('/api/generate', async (req, res) => {
   const model = typeof req.body?.model === 'string' ? req.body.model : undefined;
@@ -313,67 +416,37 @@ app.post('/api/generate', async (req, res) => {
     stream
   };
 
-  try {
-    const lmResponse = await lmFetch(CHAT_PATHS, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: stream ? 'text/event-stream' : 'application/json'
-      },
-      body: JSON.stringify(payload)
+  const lmResponse = await lmFetch(CHAT_PATHS, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: stream ? 'text/event-stream' : 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!stream) {
+    const json = (await lmResponse.json()) as JsonRecord;
+    const text = extractAssistantText(json);
+    const doneReason = extractFinishReason(json);
+
+    res.json({
+      model: model ?? 'unknown',
+      created_at: now,
+      response: text,
+      done: true,
+      done_reason: doneReason,
+      context: []
     });
-
-    if (!stream) {
-      const json = (await (lmResponse as unknown as globalThis.Response).json()) as JsonRecord;
-      const text = extractAssistantText(json);
-      const doneReason = extractFinishReason(json);
-
-      res.json({
-        model: model ?? 'unknown',
-        created_at: now,
-        response: text,
-        done: true,
-        done_reason: doneReason,
-        context: []
-      });
-      return;
-    }
-
-    res.setHeader('Content-Type', 'application/x-ndjson');
-    res.setHeader('Transfer-Encoding', 'chunked');
-
-    await streamSseAsJson(lmResponse as unknown as globalThis.Response, (chunk) => {
-      const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
-      const first = choices[0] as JsonRecord | undefined;
-      const delta = first?.delta as JsonRecord | undefined;
-      const piece = typeof delta?.content === 'string' ? delta.content : '';
-
-      if (piece.length > 0) {
-        const out = {
-          model: model ?? 'unknown',
-          created_at: now,
-          response: piece,
-          done: false
-        };
-        res.write(`${JSON.stringify(out)}\n`);
-      }
-    });
-
-    res.write(
-      `${JSON.stringify({
-        model: model ?? 'unknown',
-        created_at: now,
-        response: '',
-        done: true,
-        done_reason: 'stop',
-        context: []
-      })}\n`
-    );
-    res.end();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    res.status(502).json({ error: message });
+    return;
   }
+
+  await proxyChatToNdjson(
+    res,
+    lmResponse,
+    (piece) => ({ model: model ?? 'unknown', created_at: now, response: piece, done: false }),
+    () => ({ model: model ?? 'unknown', created_at: now, response: '', done: true, done_reason: 'stop', context: [] })
+  );
 });
 
 app.post('/api/chat', async (req, res) => {
@@ -406,200 +479,121 @@ app.post('/api/chat', async (req, res) => {
     stream
   };
 
-  try {
-    const lmResponse = await lmFetch(CHAT_PATHS, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: stream ? 'text/event-stream' : 'application/json'
-      },
-      body: JSON.stringify(payload)
+  const lmResponse = await lmFetch(CHAT_PATHS, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: stream ? 'text/event-stream' : 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!stream) {
+    const json = (await lmResponse.json()) as JsonRecord;
+    const text = extractAssistantText(json);
+    const doneReason = extractFinishReason(json);
+
+    res.json({
+      model: model ?? 'unknown',
+      created_at: now,
+      message: { role: 'assistant', content: text },
+      done: true,
+      done_reason: doneReason
     });
-
-    if (!stream) {
-      const json = (await (lmResponse as unknown as globalThis.Response).json()) as JsonRecord;
-      const text = extractAssistantText(json);
-      const doneReason = extractFinishReason(json);
-
-      res.json({
-        model: model ?? 'unknown',
-        created_at: now,
-        message: {
-          role: 'assistant',
-          content: text
-        },
-        done: true,
-        done_reason: doneReason
-      });
-      return;
-    }
-
-    res.setHeader('Content-Type', 'application/x-ndjson');
-    res.setHeader('Transfer-Encoding', 'chunked');
-
-    await streamSseAsJson(lmResponse as unknown as globalThis.Response, (chunk) => {
-      const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
-      const first = choices[0] as JsonRecord | undefined;
-      const delta = first?.delta as JsonRecord | undefined;
-      const piece = typeof delta?.content === 'string' ? delta.content : '';
-
-      if (piece.length > 0) {
-        const out = {
-          model: model ?? 'unknown',
-          created_at: now,
-          message: {
-            role: 'assistant',
-            content: piece
-          },
-          done: false
-        };
-        res.write(`${JSON.stringify(out)}\n`);
-      }
-    });
-
-    res.write(
-      `${JSON.stringify({
-        model: model ?? 'unknown',
-        created_at: now,
-        message: {
-          role: 'assistant',
-          content: ''
-        },
-        done: true,
-        done_reason: 'stop'
-      })}\n`
-    );
-    res.end();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    res.status(502).json({ error: message });
+    return;
   }
+
+  await proxyChatToNdjson(
+    res,
+    lmResponse,
+    (piece) => ({
+      model: model ?? 'unknown',
+      created_at: now,
+      message: { role: 'assistant', content: piece },
+      done: false
+    }),
+    () => ({
+      model: model ?? 'unknown',
+      created_at: now,
+      message: { role: 'assistant', content: '' },
+      done: true,
+      done_reason: 'stop'
+    })
+  );
 });
 
-app.post('/api/embed', async (req, res) => {
+app.post('/api/embed', asyncHandler(async (req, res) => {
   const model = typeof req.body?.model === 'string' ? req.body.model : undefined;
   const input = req.body?.input;
   const inputs = Array.isArray(input) ? input : [input];
 
-  try {
-    const lmResponse = await lmFetch(EMBEDDINGS_PATHS, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json'
-      },
-      body: JSON.stringify({ model, input: inputs })
-    });
+  const lmResponse = await lmFetch(EMBEDDINGS_PATHS, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json'
+    },
+    body: JSON.stringify({ model, input: inputs })
+  });
 
-    const json = (await (lmResponse as unknown as globalThis.Response).json()) as JsonRecord;
-    const data = Array.isArray(json.data) ? (json.data as unknown[]) : [];
+  const json = (await lmResponse.json()) as JsonRecord;
+  const data = Array.isArray(json.data) ? (json.data as unknown[]) : [];
 
-    const embeddings = data
-      .map((item) => {
-        if (!item || typeof item !== 'object') {
-          return null;
-        }
-        const embedding = (item as JsonRecord).embedding;
-        return Array.isArray(embedding) ? (embedding as number[]) : null;
-      })
-      .filter((item): item is number[] => item !== null);
+  const embeddings = data
+    .map((item) => {
+      if (!item || typeof item !== 'object') {
+        return null;
+      }
+      const embedding = (item as JsonRecord).embedding;
+      return Array.isArray(embedding) ? (embedding as number[]) : null;
+    })
+    .filter((item): item is number[] => item !== null);
 
-    res.json({
-      model: model ?? 'unknown',
-      embeddings,
-      total_duration: 0,
-      load_duration: 0,
-      prompt_eval_count: inputs.length
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    res.status(502).json({ error: message });
-  }
-});
+  res.json({
+    model: model ?? 'unknown',
+    embeddings,
+    total_duration: 0,
+    load_duration: 0,
+    prompt_eval_count: inputs.length
+  });
+}));
 
 app.post('/api/create', (req, res) => {
   const model = typeof req.body?.model === 'string' ? req.body.model : 'unknown';
-  const stream = req.body?.stream !== false;
+  respondStatusStream(res, req.body?.stream !== false, [`using existing layer for ${model}`, 'success']);
+});
 
-  if (stream) {
-    res.setHeader('Content-Type', 'application/x-ndjson');
-    res.write(`${JSON.stringify({ status: `using existing layer for ${model}` })}\n`);
-    res.write(`${JSON.stringify({ status: 'success' })}\n`);
-    res.end();
+app.post('/api/copy', asyncHandler(async (req, res) => {
+  const source = typeof req.body?.source === 'string' ? req.body.source : '';
+  if (!(await requireModel(res, source))) {
     return;
   }
 
-  res.json({ status: 'success' });
-});
-
-app.post('/api/copy', async (req, res) => {
-  const source = typeof req.body?.source === 'string' ? req.body.source : '';
-
-  try {
-    const models = await getModels();
-    const found = models.some((model) => model.id === source);
-
-    if (!found) {
-      res.status(404).json({ error: `source model not found: ${source}` });
-      return;
-    }
-
-    res.status(200).end();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    res.status(502).json({ error: message });
-  }
-});
+  res.status(200).end();
+}));
 
 app.post('/api/pull', (req, res) => {
   const model = typeof req.body?.model === 'string' ? req.body.model : 'unknown';
-  const stream = req.body?.stream !== false;
-
-  if (stream) {
-    res.setHeader('Content-Type', 'application/x-ndjson');
-    res.write(`${JSON.stringify({ status: `pulling manifest for ${model}` })}\n`);
-    res.write(`${JSON.stringify({ status: 'verifying sha256 digest' })}\n`);
-    res.write(`${JSON.stringify({ status: 'success' })}\n`);
-    res.end();
-    return;
-  }
-
-  res.json({ status: 'success' });
+  respondStatusStream(res, req.body?.stream !== false, [
+    `pulling manifest for ${model}`,
+    'verifying sha256 digest',
+    'success'
+  ]);
 });
 
 app.post('/api/push', (req, res) => {
   const model = typeof req.body?.model === 'string' ? req.body.model : 'unknown';
-  const stream = req.body?.stream !== false;
+  respondStatusStream(res, req.body?.stream !== false, [`pushing ${model}`, 'success']);
+});
 
-  if (stream) {
-    res.setHeader('Content-Type', 'application/x-ndjson');
-    res.write(`${JSON.stringify({ status: `pushing ${model}` })}\n`);
-    res.write(`${JSON.stringify({ status: 'success' })}\n`);
-    res.end();
+app.delete('/api/delete', asyncHandler(async (req, res) => {
+  const model = typeof req.body?.model === 'string' ? req.body.model : '';
+  if (!(await requireModel(res, model))) {
     return;
   }
 
-  res.json({ status: 'success' });
-});
-
-app.delete('/api/delete', async (req, res) => {
-  const model = typeof req.body?.model === 'string' ? req.body.model : '';
-
-  try {
-    const models = await getModels();
-    const found = models.some((item) => item.id === model);
-
-    if (!found) {
-      res.status(404).json({ error: `model not found: ${model}` });
-      return;
-    }
-
-    res.status(200).end();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    res.status(502).json({ error: message });
-  }
-});
+  res.status(200).end();
+}));
 
 app.use((error: unknown, req: Request, res: ExpressResponse, _next: () => void) => {
   const message = error instanceof Error ? error.message : 'Internal server error';
