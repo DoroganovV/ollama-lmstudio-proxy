@@ -1,0 +1,31 @@
+services:
+
+  ollama-lmstudio-proxy:
+    container_name: ollama-lmstudio-proxy
+    image: node:24-alpine
+    restart: always
+    mem_limit: 256m
+    cpus: '0.3'
+    user: "node"
+    working_dir: /home/node/app
+    environment:
+      - NODE_ENV=production
+      - PORT=11434
+      - LM_STUDIO_BASE_URL=http://host.docker.internal:12345
+      - LM_STUDIO_API_KEY=
+    volumes:
+      - ./ollama-lmstudio-proxy:/home/node/app
+    ports:
+      - "11434:11434"
+    command: sh -c "npm install && npm start"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:11434/ || exit 1"]
+      interval: 120s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  default:
+    external: true
+    name: shared_network

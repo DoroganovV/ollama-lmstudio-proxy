@@ -26,26 +26,24 @@ Proxy service that accepts Ollama-compatible API requests on port `11434` and fo
 - `LM_STUDIO_EMBEDDINGS_PATHS` (default: `/v1/embeddings`)
 - `LM_STUDIO_API_KEY` (optional; if set, sent as `Authorization: Bearer <key>` on every LM Studio request)
 
+## Files
+
+- `ollama-lmstudio-proxy/` - Express server source (`package.json`, `tsconfig.json`, `src/server.ts`).
+- `docker-compose.yml` - standalone Compose file for running this service on its own.
+
 ## Run locally
 
 ```bash
+cd ollama-lmstudio-proxy
 npm install
 npm run start
 ```
 
-## Docker Compose example
+## Running (docker-compose)
 
-```yaml
-services:
-  llm_proxy:
-    container_name: llm_proxy
-    build:
-      context: ./llm_proxy
-    restart: unless-stopped
-    environment:
-      - PORT=11434
-      - LM_STUDIO_BASE_URL=http://localhost:11435
-      - LM_STUDIO_API_KEY=
-    ports:
-      - "11434:11434"
+```bash
+docker compose up -d
 ```
+
+Already wired up in [`docker-compose.yml`](docker-compose.yml) as the `ollama-lmstudio-proxy`
+service, listening on port `11434`.
